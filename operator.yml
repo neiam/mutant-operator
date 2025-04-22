@@ -1,6 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  namespace: mutants
   name: mutantops-operator
 spec:
   replicas: 1
@@ -28,11 +29,13 @@ spec:
               fieldPath: metadata.name
         - name: OPERATOR_NAME
           value: "mutantops-operator"
+
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: mutantops-operator
+  namespace: mutants
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -95,6 +98,6 @@ roleRef:
   kind: ClusterRole
   name: mutantops-operator
 subjects:
-- kind: ServiceAccount
-  name: mutantops-operator
-  namespace: default
+  - kind: ServiceAccount
+    name: mutantops-operator
+    namespace: mutants
