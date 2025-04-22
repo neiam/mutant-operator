@@ -1,0 +1,43 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mutantdeployments.neiam.org
+spec:
+  group: neiam.org
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                deployment:
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                mutations:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      label:
+                        type: string
+                      env:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      instances:
+                        type: integer
+              required:
+                - deployment
+                - mutations
+  scope: Namespaced
+  names:
+    plural: mutantdeployments
+    singular: mutantdeployment
+    kind: MutantDeployment
+    shortNames:
+      - md
