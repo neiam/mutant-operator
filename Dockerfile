@@ -4,5 +4,5 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:buster-slim
-COPY --from=builder /app/target/release/mutantops /usr/local/bin/mutantops
-CMD ["mutantops"]
+COPY --from=builder /app/target/release/mutant-deployment /usr/local/bin/mutant-deployment
+CMD ["mutant-deployment"]

@@ -24,4 +24,5 @@ futures = "0.3.31"
 offline = true
 
 [[bin]]
-name = "main-deployment"
+name = "mutant-deployment"
+path = "src/bin/main-deployment.rs"
