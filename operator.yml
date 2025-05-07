@@ -16,7 +16,7 @@ spec:
       serviceAccountName: mutantops-operator
       containers:
       - name: mutantops-operator
-        image: your-registry/mutantops:v1
+        image: ghcr.io/neiam/mutant-operator:latest
         imagePullPolicy: Always
         env:
         - name: WATCH_NAMESPACE
