@@ -1,0 +1,70 @@
+name: dependency-updates
+# Security updates as a pull request: scripts/dependency-update finds the
+# crates in Cargo.lock with a known vulnerability (osv-scanner, against
+# OSV) that a newer version fixes, bumps them, and keeps one pull
+# request — deps/security-cargo — refreshed in place, closing it once
+# there's nothing left to fix. The pull request is opened by the forge's
+# CI account (gg-security) with this job's own token; its CI (audit.yml
+# among it) is what shows the fixes landed.
+#
+# Daily, before the nightly audit, and by hand from the Actions page
+# (`gg ci dispatch dependency-updates`). Taken from gitgud's workflow of
+# the same name. Beside docker-build-push.yml in .github/workflows, for
+# the reason audit.yml gives.
+on:
+  schedule:
+    - cron: "57 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write # push the deps/security-cargo branch
+  pull-requests: write # open, refresh and close its pull request
+
+jobs:
+  update:
+    runs-on: arc-runner-set
+    steps:
+      # A bare arc-runner-set container may have no git, and
+      # actions/checkout without git downloads a tarball with no .git
+      # for the script to commit with. Installed first, then.
+      - name: Tools
+        run: |
+          if ! command -v git >/dev/null || ! command -v python3 >/dev/null || ! command -v curl >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y git curl ca-certificates python3
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          # The deps/security-cargo branch too, to tell whether a refresh
+          # changed anything before pushing it.
+          fetch-depth: 0
+
+      # The toolchain the Dockerfile builds the image with (rust:1.83): a
+      # lockfile is only as good as the resolver that wrote it, and a bump
+      # that needs a newer compiler than the image's should fail here,
+      # not there. Installed directly, since this runner sets ImageOS to
+      # "selfhosted" over anything a workflow says.
+      - name: Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.83
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Pinned and checked, as in audit.yml; bump both together.
+      - name: Fetch osv-scanner
+        env:
+          OSV_VERSION: v2.6.0
+          OSV_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
+        run: |
+          curl -sSfL -o /tmp/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SHA256}  /tmp/osv-scanner" | sha256sum -c -
+          chmod +x /tmp/osv-scanner
+
+      # The script sets its own git identity (gg-security) before it
+      # commits: a fresh container has none.
+      - name: Update
+        env:
+          OSV_SCANNER: /tmp/osv-scanner
+          GITHUB_TOKEN: ${{ github.token }}
+        run: scripts/dependency-update --base "${{ github.ref_name }}"
