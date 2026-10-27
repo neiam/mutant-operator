@@ -10,7 +10,11 @@ env:
   IMAGE_NAME: neiam/mutant-operator
 
 jobs:
+  # ghcr.io from GitHub only. The forge reads .github/workflows too, and
+  # there the ghcr.io login 403s; .forgejo/workflows/image.yml publishes
+  # to the forge's own registry instead.
   build-and-push:
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     permissions:
       contents: read
