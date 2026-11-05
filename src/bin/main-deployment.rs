@@ -1,18 +1,16 @@
 use futures::StreamExt;
-use k8s_openapi::api::{apps::v1::Deployment, core::v1::EnvVar};
+use k8s_openapi::api::apps::v1::Deployment;
 use kube::{
-    api::{Api, DeleteParams, ListParams, ObjectMeta, PostParams},
+    api::{Api, PostParams},
     runtime::controller::{self, Action, Controller},
     Client, CustomResource, ResourceExt,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt, sync::Arc};
-use kube::api::{Patch, PatchParams};
 use kube::runtime::watcher;
 use tokio::time::Duration;
-use tracing::{info, instrument};
-use std::error::Error;
+use tracing::info;
 
 // Define a custom error type
 #[derive(Debug)]
@@ -65,7 +63,7 @@ pub struct Mutation {
 }
 
 // #[instrument(skip(_ctx))]
-async fn reconcile(mutant: Arc<MutantDeployment>, ctx: Arc<()>) -> Result<Action, MutantopsError>  {
+async fn reconcile(mutant: Arc<MutantDeployment>, _ctx: Arc<()>) -> Result<Action, MutantopsError>  {
     let client = Client::try_default().await?;
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), &mutant.namespace().unwrap());
 
