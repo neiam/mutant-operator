@@ -1,0 +1,45 @@
+name: clippy
+# Lints gate master: every warning clippy or rustc raises fails the run.
+# The same command every Rust repository on the forge runs, over every
+# target, against the committed Cargo.lock.
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push supersedes this run: on a branch or PR the run in
+# progress is cancelled; on master it finishes, and only a run still
+# waiting is replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  clippy:
+    runs-on: arc-runner-set
+    steps:
+      # A bare arc-runner-set container ships no compilers: sea-orm's
+      # native-tls needs the OpenSSL headers and pkg-config, ring's build
+      # script a C toolchain.
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git curl ca-certificates build-essential pkg-config libssl-dev
+
+      - uses: actions/checkout@v4
+
+      # The toolchain the image builds with (rust:1.92) and
+      # dependency-updates.yml resolves the lockfile with (1.92.0).
+      # Installed directly, since this runner sets ImageOS to "selfhosted"
+      # over anything a workflow says.
+      - name: Rust
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.92.0 -c clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
