@@ -20,6 +20,9 @@ sea-orm = { version = "2.0.4", features = ["sqlx-postgres", "runtime-tokio-nativ
 futures = "0.3.31"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "tower-log", "query"] }
 getrandom = "0.3"
+# /metrics for the cluster's Prometheus (see src/metrics.rs); "process" adds
+# the standard process_* series on Linux.
+prometheus = { version = "0.14", default-features = false, features = ["process"] }
 
 
 [package.metadata.sqlx]

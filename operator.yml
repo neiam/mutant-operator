@@ -12,6 +12,10 @@ spec:
     metadata:
       labels:
         app: mutantops-operator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "9568"
     spec:
       serviceAccountName: mutantops-operator
       containers:
@@ -43,6 +47,9 @@ spec:
         ports:
         - name: http
           containerPort: 8080
+        # /metrics, on its own port; the Service does not name it.
+        - name: metrics
+          containerPort: 9568
 ---
 apiVersion: v1
 kind: Service

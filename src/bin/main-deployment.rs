@@ -1,7 +1,7 @@
 use kube::Client;
-use mutantops::{api, controller};
+use mutantops::{api, controller, metrics};
 use std::net::SocketAddr;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Address the HTTP API listens on.
 const DEFAULT_API_ADDR: &str = "0.0.0.0:8080";
@@ -26,6 +26,23 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = std::env::var("MUTANT_API_ADDR")
         .unwrap_or_else(|_| DEFAULT_API_ADDR.into())
         .parse()?;
+
+    // Metrics get their own listener, which the API's Service does not name.
+    // A failure here is logged, not fatal: the operator matters more than
+    // its metrics.
+    let metrics_addr: SocketAddr = std::env::var("MUTANT_METRICS_ADDR")
+        .unwrap_or_else(|_| metrics::DEFAULT_METRICS_ADDR.into())
+        .parse()?;
+    tokio::spawn(async move {
+        let res = async {
+            let listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+            info!(addr = %metrics_addr, "metrics listening");
+            metrics::serve(listener).await
+        };
+        if let Err(e) = res.await {
+            error!(addr = %metrics_addr, "metrics listener failed: {e}");
+        }
+    });
 
     let server = async {
         let listener = tokio::net::TcpListener::bind(addr).await?;

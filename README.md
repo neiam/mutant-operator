@@ -235,3 +235,25 @@ A listed variant looks like:
 
 A Mutation adds its `name`, `namespace`, base `deployment`, `variants`,
 `secret`, `summary`, `message` and `readOnly`.
+
+## Metrics
+
+Prometheus metrics are served at `/metrics` on a listener of their own,
+`MUTANT_METRICS_ADDR` (default `0.0.0.0:9568`), which the API's Service
+does not name. `operator.yml` annotates the pod for scraping. `kind` is
+`MutantDeployment` or `Mutation`.
+
+| Metric | Type | Labels | What it says |
+| --- | --- | --- | --- |
+| `mutant_operator_reconciliations_total` | counter | `kind`, `outcome` (`ok`/`error`) | Reconciles finished |
+| `mutant_operator_reconcile_duration_seconds` | histogram | `kind`, `outcome` | Time one reconcile took |
+| `mutant_operator_reconcile_errors_total` | counter | `kind`, `error` (`invalid`/`api`/`client`) | Failed reconciles, retried after 10s |
+| `mutant_operator_controller_errors_total` | counter | `kind`, `error` (`queue`/`object_not_found`/`runner`) | Other controller errors; `queue` means a watch failed |
+| `mutant_operator_managed_objects` | gauge | `kind` | Resources in the controller's cache |
+| `mutant_operator_variants` | gauge | `kind` | Variants declared in specs, summed |
+| `mutant_operator_mutation_variants` | gauge | `state` | Mutation variants by reported state |
+| `mutant_operator_build_info` | gauge | `version` | Always 1 |
+
+Plus the standard `process_*` series (CPU, memory, file descriptors). The
+gauges are read from the controllers' caches at scrape time; the counters
+reset when the pod restarts.

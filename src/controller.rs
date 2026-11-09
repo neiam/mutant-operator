@@ -8,6 +8,7 @@ use crate::crd::{
     validate_base, MutantDeployment, Mutation, MutationStatus, Variant, VariantState, VariantStatus,
     MUTATION_LABEL, OWNER_LABEL,
 };
+use crate::metrics::{self, KIND_MUTANT, KIND_MUTATION};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Secret;
@@ -15,7 +16,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
     api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams},
     runtime::{
-        controller::{Action, Controller},
+        controller::{self, Action, Controller},
         watcher,
     },
     Client, Resource, ResourceExt,
@@ -41,6 +42,17 @@ impl fmt::Display for MutantopsError {
         match self {
             MutantopsError::Invalid(msg) => write!(f, "invalid resource: {msg}"),
             MutantopsError::Kube(err) => write!(f, "kube error: {err}"),
+        }
+    }
+}
+
+impl MutantopsError {
+    /// A short, bounded name for the error, for metrics.
+    pub fn label(&self) -> &'static str {
+        match self {
+            MutantopsError::Invalid(_) => "invalid",
+            MutantopsError::Kube(kube::Error::Api(_)) => "api",
+            MutantopsError::Kube(_) => "client",
         }
     }
 }
@@ -216,9 +228,22 @@ async fn ensure_secret(api: &Api<Secret>, m: &Mutation) -> Result<Result<String,
     }
 }
 
-fn error_policy<K: ResourceExt>(obj: Arc<K>, error: &MutantopsError, _ctx: Arc<Ctx>) -> Action {
+fn error_policy<K: Resource<DynamicType = ()>>(obj: Arc<K>, error: &MutantopsError, _ctx: Arc<Ctx>) -> Action {
+    metrics::reconcile_error(&K::kind(&()), error.label());
     warn!(name = %obj.name_any(), ns = ?obj.namespace(), "reconcile failed: {error}");
     Action::requeue(Duration::from_secs(10))
+}
+
+/// Counts what the controller's stream reports, beyond the reconcile
+/// errors `error_policy` has already counted.
+fn stream_error<E, Q>(kind: &'static str, err: &controller::Error<E, Q>) {
+    let label = match err {
+        controller::Error::ReconcilerFailed(..) => return,
+        controller::Error::ObjectNotFound(_) => "object_not_found",
+        controller::Error::QueueError(_) => "queue",
+        controller::Error::RunnerError(_) => "runner",
+    };
+    metrics::controller_error(kind, label);
 }
 
 /// Runs both controllers until a shutdown signal.
@@ -230,23 +255,33 @@ pub async fn run(client: Client) {
 
     let mutants = Controller::new(Api::<MutantDeployment>::all(client.clone()), watcher::Config::default())
         .owns(Api::<Deployment>::all(client.clone()), owned())
-        .shutdown_on_signal()
-        .run(reconcile_mutant, error_policy, ctx.clone())
+        .shutdown_on_signal();
+    let mutations = Controller::new(Api::<Mutation>::all(client.clone()), watcher::Config::default())
+        .owns(Api::<Deployment>::all(client.clone()), owned())
+        .shutdown_on_signal();
+    metrics::track(mutants.store(), mutations.store());
+
+    let mutants = mutants
+        .run(|o, c| metrics::instrument(KIND_MUTANT, reconcile_mutant(o, c)), error_policy, ctx.clone())
         .for_each(|res| async move {
             match res {
-                Ok((obj, _)) => info!(kind = "MutantDeployment", name = %obj.name, ns = ?obj.namespace, "reconciled"),
-                Err(err) => warn!(kind = "MutantDeployment", "reconcile failed: {err}"),
+                Ok((obj, _)) => info!(kind = KIND_MUTANT, name = %obj.name, ns = ?obj.namespace, "reconciled"),
+                Err(err) => {
+                    stream_error(KIND_MUTANT, &err);
+                    warn!(kind = KIND_MUTANT, "reconcile failed: {err}");
+                }
             }
         });
 
-    let mutations = Controller::new(Api::<Mutation>::all(client.clone()), watcher::Config::default())
-        .owns(Api::<Deployment>::all(client.clone()), owned())
-        .shutdown_on_signal()
-        .run(reconcile_mutation, error_policy, ctx)
+    let mutations = mutations
+        .run(|o, c| metrics::instrument(KIND_MUTATION, reconcile_mutation(o, c)), error_policy, ctx)
         .for_each(|res| async move {
             match res {
-                Ok((obj, _)) => info!(kind = "Mutation", name = %obj.name, ns = ?obj.namespace, "reconciled"),
-                Err(err) => warn!(kind = "Mutation", "reconcile failed: {err}"),
+                Ok((obj, _)) => info!(kind = KIND_MUTATION, name = %obj.name, ns = ?obj.namespace, "reconciled"),
+                Err(err) => {
+                    stream_error(KIND_MUTATION, &err);
+                    warn!(kind = KIND_MUTATION, "reconcile failed: {err}");
+                }
             }
         });
 
