@@ -29,6 +29,31 @@ spec:
               fieldPath: metadata.name
         - name: OPERATOR_NAME
           value: "mutantops-operator"
+        # The HTTP API stays off until this is set. Create the secret with:
+        #   kubectl -n mutants create secret generic mutantops-api \
+        #     --from-literal=token="$(openssl rand -hex 32)"
+        - name: MUTANT_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: mutantops-api
+              key: token
+              optional: true
+        ports:
+        - name: http
+          containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mutantops-api
+  namespace: mutants
+spec:
+  selector:
+    app: mutantops-operator
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
 
 ---
 apiVersion: v1
@@ -80,6 +105,8 @@ rules:
   - neiam.org
   resources:
   - mutantdeployments
+  - mutations
+  - mutations/status
   verbs:
   - create
   - delete

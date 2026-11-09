@@ -1,135 +1,49 @@
-use futures::StreamExt;
-use k8s_openapi::api::apps::v1::Deployment;
-use kube::{
-    api::{Api, PostParams},
-    runtime::controller::{self, Action, Controller},
-    Client, CustomResource, ResourceExt,
-};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fmt, sync::Arc};
-use kube::runtime::watcher;
-use tokio::time::Duration;
-use tracing::info;
+use kube::Client;
+use mutantops::{api, controller};
+use std::net::SocketAddr;
+use tracing::{info, warn};
 
-// Define a custom error type
-#[derive(Debug)]
-pub enum MutantopsError {
-    ParseError(String),
-    IoError(std::io::Error),
-    KubeError(kube::Error),
-}
-
-impl std::error::Error for MutantopsError {}
-
-// Implement the `fmt::Display` trait for `MyError`
-impl fmt::Display for MutantopsError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            MutantopsError::ParseError(msg) => write!(f, "Parse error: {}", msg),
-            MutantopsError::IoError(err) => write!(f, "IO error: {}", err),
-            MutantopsError::KubeError(err) => write!(f, "Kube error: {}", err),
-        }
-    }
-}
-
-// Implement the `From` trait for `std::io::Error`
-impl From<std::io::Error> for MutantopsError {
-    fn from(err: std::io::Error) -> Self {
-        MutantopsError::IoError(err)
-    }
-}
-
-// Implement the `From` trait for `kube::Error`
-impl From<kube::Error> for MutantopsError {
-    fn from(err: kube::Error) -> Self {
-        MutantopsError::KubeError(err)
-    }
-}
-
-#[derive(CustomResource, Deserialize, Serialize, Clone, Debug, JsonSchema)]
-#[kube(group = "neiam.org", version = "v1", kind = "MutantDeployment", namespaced)]
-pub struct MutantDeploymentSpec {
-    #[schemars(skip)]
-    pub deployment: Deployment,
-    pub mutations: Vec<Mutation>,
-}
-
-#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
-pub struct Mutation {
-    pub label: String,
-    pub env: HashMap<String, String>,
-    pub instances: i32,
-}
-
-// #[instrument(skip(_ctx))]
-async fn reconcile(mutant: Arc<MutantDeployment>, _ctx: Arc<()>) -> Result<Action, MutantopsError>  {
-    let client = Client::try_default().await?;
-    let deployments: Api<Deployment> = Api::namespaced(client.clone(), &mutant.namespace().unwrap());
-
-    let base_deploy = &mutant.spec.deployment;
-
-    for mutation in &mutant.spec.mutations {
-        let mut new_deploy = base_deploy.clone();
-
-        // Modify name
-        let name = format!("{}-{}", base_deploy.metadata.name.clone().unwrap_or("mutant".into()), mutation.label);
-        new_deploy.metadata.name = Some(name.clone());
-        new_deploy.metadata.labels.get_or_insert_with(Default::default).insert("mutation".to_string(), mutation.label.clone());
-
-        // Modify replicas
-        if let Some(spec) = &mut new_deploy.spec {
-            spec.replicas = Some(mutation.instances);
-
-            if let Some(template) = &mut spec.template.spec {
-                for container in &mut template.containers {
-                    let envs = container.env.get_or_insert(vec![]);
-                    for (key, val) in &mutation.env {
-                        envs.push(k8s_openapi::api::core::v1::EnvVar {
-                            name: key.clone(),
-                            value: Some(val.clone()),
-                            value_from: None,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Apply the new deployment
-        match deployments.get(&name).await {
-            Ok(_) => {
-                deployments.replace(&name, &PostParams::default(), &new_deploy).await?;
-            }
-            Err(_) => {
-                deployments.create(&PostParams::default(), &new_deploy).await?;
-            }
-        }
-    }
-
-    Ok(Action::await_change())
-}
-
-fn error_policy(_object: Arc<MutantDeployment>, error: &MutantopsError, _ctx: Arc<()>) -> controller::Action {
-    println!("Error reconciling: {:?}", error);
-    controller::Action::requeue(Duration::from_secs(10))
-}
+/// Address the HTTP API listens on.
+const DEFAULT_API_ADDR: &str = "0.0.0.0:8080";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let client = Client::try_default().await?;
-    let crds = Api::<MutantDeployment>::all(client.clone());
 
-    Controller::new(crds, watcher::Config::default())
-        .run(reconcile, error_policy, Arc::new(()))
-        .for_each(|res| async move {
-            match res {
-                Ok((mutant, _)) => info!("Reconciled {:?}", mutant.name),
-                Err(err) => info!("Reconcile failed: {:?}", err),
-            }
-        })
-        .await;
+    // The API can create Deployments with arbitrary env in any namespace the
+    // operator can write to, so it needs a token unless explicitly opted out.
+    let token = std::env::var("MUTANT_API_TOKEN").ok().filter(|t| !t.is_empty());
+    let insecure = std::env::var("MUTANT_API_INSECURE").is_ok_and(|v| v == "true");
+    let api_enabled = token.is_some() || insecure;
+    if token.is_none() && insecure {
+        warn!("MUTANT_API_INSECURE=true: HTTP API is serving without authentication");
+    }
 
+    let addr: SocketAddr = std::env::var("MUTANT_API_ADDR")
+        .unwrap_or_else(|_| DEFAULT_API_ADDR.into())
+        .parse()?;
+
+    let server = async {
+        if !api_enabled {
+            warn!("HTTP API disabled: set MUTANT_API_TOKEN (or MUTANT_API_INSECURE=true) to enable it");
+            std::future::pending::<()>().await;
+        }
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        info!(%addr, "HTTP API listening");
+        axum::serve(listener, api::router(api::AppState::new(client.clone(), token)))
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+            })
+            .await?;
+        anyhow::Ok(())
+    };
+
+    // The controller stops on SIGINT/SIGTERM; when it does, so does the API.
+    tokio::select! {
+        () = controller::run(client.clone()) => {}
+        res = server => res?,
+    }
     Ok(())
 }
