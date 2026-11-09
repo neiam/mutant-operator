@@ -158,10 +158,24 @@ resource.customizations.health.neiam.org_Mutation: |
 The operator serves an HTTP API to create, list and delete Mutations and
 their variants.
 
-The API is off until `MUTANT_API_TOKEN` is set (`operator.yml` reads it from
-the `mutantops-api` secret). Every `/api` request then needs
-`Authorization: Bearer <token>`. `MUTANT_API_INSECURE=true` serves it without
-auth. `MUTANT_API_ADDR` sets the listen address (default `0.0.0.0:8080`).
+Every `/api` request needs `Authorization: Bearer <token>`, and which token
+depends on the request:
+
+- **A Mutation's own token** (`token` in its `<name>-secret`) allows getting
+  that Mutation and listing, adding and removing its variants, and nothing
+  else. An app in the Mutation's namespace reads it from that Secret, so it
+  can manage its own Mutation's variants without credentials for anything
+  else. The operator only accepts a Secret owned by the Mutation, so one
+  created by someone else does not count.
+- **The admin token** (`MUTANT_API_TOKEN`, optional; `operator.yml` reads it
+  from the `mutantops-api` secret) also allows listing every Mutation in a
+  namespace and creating or deleting a Mutation. Without it, those answer
+  401.
+
+A wrong token and a Mutation that does not exist both answer 401, so one
+Mutation's token cannot probe for others. `MUTANT_API_INSECURE=true` serves
+the API without auth, for local development. `MUTANT_API_ADDR` sets the
+listen address (default `0.0.0.0:8080`).
 
 ```text
 GET    /api/v1/namespaces/{ns}/mutations
@@ -182,7 +196,7 @@ Mutation's `resourceVersion`, so none is lost.
 ```sh
 kubectl -n mutants create secret generic mutantops-api --from-literal=token="$(openssl rand -hex 32)"
 kubectl -n mutants rollout restart deploy/mutantops-operator
-TOKEN=$(kubectl -n mutants get secret mutantops-api -o jsonpath='{.data.token}' | base64 -d)
+TOKEN=$(kubectl -n mutants get secret mutantops-api -o jsonpath='{.data.token}' | base64 -d)   # admin
 API=http://mutantops-api.mutants.svc   # or: kubectl -n mutants port-forward svc/mutantops-api 8080:80
 NS=$API/api/v1/namespaces/default
 AUTH="Authorization: Bearer $TOKEN"
@@ -190,7 +204,9 @@ AUTH="Authorization: Bearer $TOKEN"
 # create a Mutation from a base Deployment (deployment.json)
 jq -n --slurpfile d deployment.json '{name: "web", deployment: $d[0], variants: []}' |
   curl -H "$AUTH" -H 'Content-Type: application/json' -d @- $NS/mutations
-# add and remove variants
+# add and remove variants: the admin token works, and so does web's own
+WEB=$(kubectl -n default get secret web-secret -o jsonpath='{.data.token}' | base64 -d)
+AUTH="Authorization: Bearer $WEB"
 curl -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"label":"beta","env":{"FEATURE_X":"on"},"instances":2}' $NS/mutations/web/variants
 curl -X DELETE -H "$AUTH" $NS/mutations/web/variants/beta

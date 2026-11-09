@@ -12,13 +12,15 @@ async fn main() -> anyhow::Result<()> {
 
     let client = Client::try_default().await?;
 
-    // The API can create Deployments with arbitrary env in any namespace the
-    // operator can write to, so it needs a token unless explicitly opted out.
-    let token = std::env::var("MUTANT_API_TOKEN").ok().filter(|t| !t.is_empty());
+    // Requests about one Mutation are authorized by that Mutation's own
+    // generated token. The admin token, optional, covers the rest: listing,
+    // creating and deleting Mutations.
+    let admin_token = std::env::var("MUTANT_API_TOKEN").ok().filter(|t| !t.is_empty());
     let insecure = std::env::var("MUTANT_API_INSECURE").is_ok_and(|v| v == "true");
-    let api_enabled = token.is_some() || insecure;
-    if token.is_none() && insecure {
+    if insecure {
         warn!("MUTANT_API_INSECURE=true: HTTP API is serving without authentication");
+    } else if admin_token.is_none() {
+        info!("no MUTANT_API_TOKEN: only Mutation tokens are accepted");
     }
 
     let addr: SocketAddr = std::env::var("MUTANT_API_ADDR")
@@ -26,13 +28,9 @@ async fn main() -> anyhow::Result<()> {
         .parse()?;
 
     let server = async {
-        if !api_enabled {
-            warn!("HTTP API disabled: set MUTANT_API_TOKEN (or MUTANT_API_INSECURE=true) to enable it");
-            std::future::pending::<()>().await;
-        }
         let listener = tokio::net::TcpListener::bind(addr).await?;
         info!(%addr, "HTTP API listening");
-        axum::serve(listener, api::router(api::AppState::new(client.clone(), token)))
+        axum::serve(listener, api::router(api::AppState::new(client.clone(), admin_token, insecure)))
             .with_graceful_shutdown(async {
                 let _ = tokio::signal::ctrl_c().await;
             })

@@ -13,6 +13,17 @@
 //! DELETE /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}
 //! ```
 //!
+//! ## Authorization
+//!
+//! Requests carry `Authorization: Bearer <token>`. A request about one
+//! Mutation -- getting it, listing, adding or removing its variants -- is
+//! allowed with that Mutation's own token: the `token` in the
+//! `<name>-secret` the operator generated for it, in its namespace. An app
+//! reads that Secret from its own namespace and can then manage that one
+//! Mutation's variants, and nothing else. Listing every Mutation in a
+//! namespace, and creating or deleting a Mutation, take the admin token
+//! (`MUTANT_API_TOKEN`), as does anything when no Mutation token applies.
+//!
 //! A Mutation is a Kubernetes object, so the operator keeps no state of its
 //! own. One synced by Argo CD cannot be deleted here, since the next sync
 //! would put it back, and its variants are `readOnly` too unless it carries
@@ -20,19 +31,19 @@
 //! API the variants.
 
 use crate::crd::{
-    insert_variant, is_gitops_managed, remove_variant, validate_base, validate_label, validate_variants,
-    variants_editable,
+    insert_variant, is_gitops_managed, remove_variant, secret_name, validate_base, validate_label,
+    validate_variants, variants_editable, SECRET_TOKEN_KEY,
     Mutation, MutationSpec, Variant, VariantState, VariantStatus,
 };
 use axum::{
-    extract::{Path, Request, State},
-    http::{header, StatusCode},
-    middleware::{self, Next},
+    extract::{Path, State},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Secret;
 use kube::{
     api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams},
     Client, ResourceExt,
@@ -49,13 +60,20 @@ const MAX_ATTEMPTS: usize = 5;
 #[derive(Clone)]
 pub struct AppState {
     client: Client,
-    /// Bearer token required on every `/api` request; `None` disables auth.
-    token: Option<Arc<str>>,
+    /// Admin token: any request, including listing, creating and deleting
+    /// Mutations. `None`: only Mutation tokens are accepted.
+    admin_token: Option<Arc<str>>,
+    /// Accept every request unauthenticated. For local development only.
+    insecure: bool,
 }
 
 impl AppState {
-    pub fn new(client: Client, token: Option<String>) -> Self {
-        Self { client, token: token.map(Into::into) }
+    pub fn new(client: Client, admin_token: Option<String>, insecure: bool) -> Self {
+        Self { client, admin_token: admin_token.map(Into::into), insecure }
+    }
+
+    fn mutations(&self, ns: &str) -> Api<Mutation> {
+        Api::namespaced(self.client.clone(), ns)
     }
 }
 
@@ -70,37 +88,70 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/namespaces/{ns}/mutations/{name}/variants/{label}",
             get(get_variant).delete(delete_variant),
-        )
-        .route_layer(middleware::from_fn_with_state(state.clone(), require_token));
+        );
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api/v1", api)
         .with_state(state)
 }
 
-async fn require_token(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let presented = req
-        .headers()
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if authorized(state.token.as_deref(), presented) {
-        next.run(req).await
-    } else {
-        ApiError::Unauthorized.into_response()
-    }
+        .and_then(|v| v.strip_prefix("Bearer "))
 }
 
-fn authorized(expected: Option<&str>, presented: Option<&str>) -> bool {
-    match (expected, presented) {
-        (None, _) => true,
-        (Some(want), Some(got)) => constant_time_eq(want.as_bytes(), got.as_bytes()),
-        (Some(_), None) => false,
-    }
+/// Whether `presented` is the admin token (or auth is off).
+fn admin_ok(admin_token: Option<&str>, insecure: bool, presented: Option<&str>) -> bool {
+    insecure
+        || match (admin_token, presented) {
+            (Some(want), Some(got)) => constant_time_eq(want.as_bytes(), got.as_bytes()),
+            _ => false,
+        }
+}
+
+/// Whether `secret` is the Mutation's own -- owned by the Mutation with
+/// `uid`, so not a look-alike someone else created -- and holds `presented`
+/// as its token.
+fn secret_grants(secret: &Secret, uid: &str, presented: &str) -> bool {
+    let owned = secret.owner_references().iter().any(|o| o.uid == uid);
+    let token = secret.data.as_ref().and_then(|d| d.get(SECRET_TOKEN_KEY));
+    owned && token.is_some_and(|t| constant_time_eq(&t.0, presented.as_bytes()))
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Allows only the admin token.
+fn require_admin(st: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if admin_ok(st.admin_token.as_deref(), st.insecure, bearer(headers)) {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized)
+    }
+}
+
+/// Allows the admin token, or the Mutation's own token, for a request about
+/// Mutation `name` in `ns`. Returns the Mutation.
+///
+/// Without the admin token, a Mutation that does not exist answers the same
+/// as a wrong token, so one Mutation's token cannot probe for others.
+async fn authorize_mutation(st: &AppState, headers: &HeaderMap, ns: &str, name: &str) -> ApiResult<Mutation> {
+    let presented = bearer(headers);
+    if admin_ok(st.admin_token.as_deref(), st.insecure, presented) {
+        return Ok(st.mutations(ns).get(name).await?);
+    }
+    let presented = presented.ok_or(ApiError::Unauthorized)?;
+    let m = st.mutations(ns).get_opt(name).await?.ok_or(ApiError::Unauthorized)?;
+    let uid = m.uid().ok_or(ApiError::Unauthorized)?;
+    let secret = Api::<Secret>::namespaced(st.client.clone(), ns).get_opt(&secret_name(name)).await?;
+    if secret.is_some_and(|s| secret_grants(&s, &uid, presented)) {
+        Ok(m)
+    } else {
+        Err(ApiError::Unauthorized)
+    }
 }
 
 #[derive(Debug)]
@@ -126,7 +177,10 @@ impl From<kube::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
-            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "missing or invalid bearer token".into()),
+            ApiError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                "missing or invalid bearer token: use this Mutation's token, or the admin token".into(),
+            ),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
@@ -210,41 +264,47 @@ impl From<Mutation> for MutationView {
     }
 }
 
-fn api(st: &AppState, ns: &str) -> Api<Mutation> {
-    Api::namespaced(st.client.clone(), ns)
-}
-
-async fn list_mutations(State(st): State<AppState>, Path(ns): Path<String>) -> ApiResult<Json<Vec<MutationView>>> {
-    let items = api(&st, &ns).list(&ListParams::default()).await?;
+async fn list_mutations(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(ns): Path<String>,
+) -> ApiResult<Json<Vec<MutationView>>> {
+    require_admin(&st, &headers)?;
+    let items = st.mutations(&ns).list(&ListParams::default()).await?;
     Ok(Json(items.into_iter().map(Into::into).collect()))
 }
 
 async fn get_mutation(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((ns, name)): Path<(String, String)>,
 ) -> ApiResult<Json<MutationView>> {
-    Ok(Json(api(&st, &ns).get(&name).await?.into()))
+    Ok(Json(authorize_mutation(&st, &headers, &ns, &name).await?.into()))
 }
 
 async fn create_mutation(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path(ns): Path<String>,
     Json(req): Json<CreateMutation>,
 ) -> ApiResult<(StatusCode, Json<MutationView>)> {
+    require_admin(&st, &headers)?;
     validate_label(&req.name).map_err(ApiError::BadRequest)?;
     validate_base(&req.deployment).map_err(ApiError::BadRequest)?;
     validate_variants(&req.variants).map_err(ApiError::BadRequest)?;
     let mutation = Mutation::new(&req.name, MutationSpec { deployment: req.deployment, variants: req.variants });
-    let created = api(&st, &ns).create(&PostParams::default(), &mutation).await?;
+    let created = st.mutations(&ns).create(&PostParams::default(), &mutation).await?;
     info!(%ns, name = %req.name, "mutation created");
     Ok((StatusCode::CREATED, Json(created.into())))
 }
 
 async fn delete_mutation(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((ns, name)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    let api = api(&st, &ns);
+    require_admin(&st, &headers)?;
+    let api = st.mutations(&ns);
     refuse_if_gitops(&api.get(&name).await?)?;
     api.delete(&name, &DeleteParams::default()).await?;
     info!(%ns, %name, "mutation deleted");
@@ -253,16 +313,18 @@ async fn delete_mutation(
 
 async fn list_variants(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((ns, name)): Path<(String, String)>,
 ) -> ApiResult<Json<Vec<VariantView>>> {
-    Ok(Json(MutationView::from(api(&st, &ns).get(&name).await?).variants))
+    Ok(Json(MutationView::from(authorize_mutation(&st, &headers, &ns, &name).await?).variants))
 }
 
 async fn get_variant(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((ns, name, label)): Path<(String, String, String)>,
 ) -> ApiResult<Json<VariantView>> {
-    MutationView::from(api(&st, &ns).get(&name).await?)
+    MutationView::from(authorize_mutation(&st, &headers, &ns, &name).await?)
         .variants
         .into_iter()
         .find(|v| v.variant.label == label)
@@ -272,12 +334,14 @@ async fn get_variant(
 
 async fn create_variant(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((ns, name)): Path<(String, String)>,
     Json(variant): Json<Variant>,
 ) -> ApiResult<(StatusCode, Json<Variant>)> {
+    authorize_mutation(&st, &headers, &ns, &name).await?;
     variant.validate().map_err(ApiError::BadRequest)?;
     let created = variant.clone();
-    update_variants(&api(&st, &ns), &name, |list| {
+    update_variants(&st.mutations(&ns), &name, |list| {
         insert_variant(list, variant.clone()).map_err(ApiError::Conflict)
     })
     .await?;
@@ -287,9 +351,11 @@ async fn create_variant(
 
 async fn delete_variant(
     State(st): State<AppState>,
+    headers: HeaderMap,
     Path((ns, name, label)): Path<(String, String, String)>,
 ) -> ApiResult<StatusCode> {
-    update_variants(&api(&st, &ns), &name, |list| {
+    authorize_mutation(&st, &headers, &ns, &name).await?;
+    update_variants(&st.mutations(&ns), &name, |list| {
         remove_variant(list, &label)
             .map(drop)
             .ok_or_else(|| ApiError::NotFound(format!("variant {label:?} not found")))
@@ -347,13 +413,37 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn auth() {
-        assert!(authorized(None, None));
-        assert!(authorized(None, Some("anything")));
-        assert!(authorized(Some("s3cret"), Some("s3cret")));
-        assert!(!authorized(Some("s3cret"), Some("s3cre")));
-        assert!(!authorized(Some("s3cret"), Some("s3creT")));
-        assert!(!authorized(Some("s3cret"), None));
+    fn admin_auth() {
+        assert!(admin_ok(Some("s3cret"), false, Some("s3cret")));
+        assert!(!admin_ok(Some("s3cret"), false, Some("s3cre")));
+        assert!(!admin_ok(Some("s3cret"), false, Some("s3creT")));
+        assert!(!admin_ok(Some("s3cret"), false, None));
+        // No admin token configured: nothing is admin, unless auth is off.
+        assert!(!admin_ok(None, false, Some("anything")));
+        assert!(!admin_ok(None, false, None));
+        assert!(admin_ok(None, true, None));
+    }
+
+    #[test]
+    fn mutation_token_auth() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let m = {
+            let mut m = Mutation::new("browser-snap", MutationSpec { deployment: Deployment::default(), variants: vec![] });
+            m.metadata.uid = Some("uid-1".into());
+            m.metadata.namespace = Some("crib".into());
+            m
+        };
+        let owner = OwnerReference { uid: "uid-1".into(), ..Default::default() };
+        let secret = crate::crd::build_secret(&m, owner, "tok".into());
+
+        assert!(secret_grants(&secret, "uid-1", "tok"));
+        assert!(!secret_grants(&secret, "uid-1", "tok2"));
+        assert!(!secret_grants(&secret, "uid-1", ""));
+        // The same name and token, but not owned by this Mutation.
+        assert!(!secret_grants(&secret, "uid-2", "tok"));
+        let mut tokenless = secret.clone();
+        tokenless.data = None;
+        assert!(!secret_grants(&tokenless, "uid-1", "tok"));
     }
 
     #[test]

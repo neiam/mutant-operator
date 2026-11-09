@@ -29,7 +29,9 @@ spec:
               fieldPath: metadata.name
         - name: OPERATOR_NAME
           value: "mutantops-operator"
-        # The HTTP API stays off until this is set. Create the secret with:
+        # Optional admin token for the HTTP API: listing, creating and deleting
+        # Mutations. A Mutation's own variants only need its own token, from
+        # its generated <name>-secret. Create the secret with:
         #   kubectl -n mutants create secret generic mutantops-api \
         #     --from-literal=token="$(openssl rand -hex 32)"
         - name: MUTANT_API_TOKEN
