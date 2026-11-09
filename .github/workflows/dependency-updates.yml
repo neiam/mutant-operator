@@ -47,14 +47,14 @@ jobs:
           # changed anything before pushing it.
           fetch-depth: 0
 
-      # The toolchain the Dockerfile builds the image with (rust:1.92): a
+      # The toolchain the Dockerfile builds the image with (rust:1.94): a
       # lockfile is only as good as the resolver that wrote it, and a bump
       # that needs a newer compiler than the image's should fail here,
       # not there. Installed directly, since this runner sets ImageOS to
       # "selfhosted" over anything a workflow says.
       - name: Rust
         run: |
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.92.0
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.94.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       # Pinned and checked, as in audit.yml; bump both together.
