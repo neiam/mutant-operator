@@ -242,10 +242,22 @@ pub fn summarize(variants: &[VariantStatus]) -> String {
 const ARGO_TRACKING_ANNOTATION: &str = "argocd.argoproj.io/tracking-id";
 const ARGO_TRACKING_LABEL: &str = "app.kubernetes.io/instance";
 
+/// Opts a GitOps-managed Mutation's variants back into the API: git holds
+/// the base, the API the variants. Its manifest must then leave `variants`
+/// out, so the sync never touches them.
+pub const RUNTIME_VARIANTS_ANNOTATION: &str = "mutantops.neiam.org/runtime-variants";
+
 /// Whether a GitOps tool owns this Mutation, so it changes in git and the
-/// API must not change or delete it (the sync would only put it back).
+/// API must not delete it (the sync would only put it back).
 pub fn is_gitops_managed(m: &Mutation) -> bool {
     m.annotations().contains_key(ARGO_TRACKING_ANNOTATION) || m.labels().contains_key(ARGO_TRACKING_LABEL)
+}
+
+/// Whether the API may add and remove this Mutation's variants: any Mutation
+/// made at runtime, and a GitOps-managed one that opts in with
+/// `mutantops.neiam.org/runtime-variants: "true"`.
+pub fn variants_editable(m: &Mutation) -> bool {
+    !is_gitops_managed(m) || m.annotations().get(RUNTIME_VARIANTS_ANNOTATION).is_some_and(|v| v == "true")
 }
 
 /// Name of the Secret generated for the Mutation named `mutation`.
@@ -455,6 +467,13 @@ mod tests {
         let mut m = mutation("b");
         m.labels_mut().insert(ARGO_TRACKING_LABEL.into(), "crib".into());
         assert!(is_gitops_managed(&m));
+
+        // Runtime-made: editable. Argo-synced: not, unless it opts in.
+        assert!(variants_editable(&mutation("c")));
+        assert!(!variants_editable(&m));
+        m.annotations_mut().insert(RUNTIME_VARIANTS_ANNOTATION.into(), "true".into());
+        assert!(variants_editable(&m));
+        assert!(is_gitops_managed(&m), "still not deletable through the API");
     }
 
     #[test]

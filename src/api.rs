@@ -14,11 +14,14 @@
 //! ```
 //!
 //! A Mutation is a Kubernetes object, so the operator keeps no state of its
-//! own. Ones synced by Argo CD are listed with `readOnly: true` and cannot be
-//! changed here: the next sync would put them back.
+//! own. One synced by Argo CD cannot be deleted here, since the next sync
+//! would put it back, and its variants are `readOnly` too unless it carries
+//! `mutantops.neiam.org/runtime-variants: "true"`: git holds the base, the
+//! API the variants.
 
 use crate::crd::{
     insert_variant, is_gitops_managed, remove_variant, validate_base, validate_label, validate_variants,
+    variants_editable,
     Mutation, MutationSpec, Variant, VariantState, VariantStatus,
 };
 use axum::{
@@ -151,8 +154,10 @@ struct MutationView {
     secret: Option<String>,
     summary: Option<String>,
     message: Option<String>,
-    /// Synced by Argo CD: changes in git, not here.
+    /// Synced by Argo CD: the Mutation itself changes in git, not here.
     read_only: bool,
+    /// Whether variants can be added and removed here.
+    variants_editable: bool,
 }
 
 /// A variant: its definition and its last reported state.
@@ -176,6 +181,7 @@ struct CreateMutation {
 impl From<Mutation> for MutationView {
     fn from(m: Mutation) -> Self {
         let read_only = is_gitops_managed(&m);
+        let editable = variants_editable(&m);
         let status = m.status.clone().unwrap_or_default();
         let variants = m
             .spec
@@ -187,7 +193,7 @@ impl From<Mutation> for MutationView {
                     VariantStatus::rejected(&v.label, VariantState::Progressing, "not yet reconciled".into())
                 }),
                 variant: v.clone(),
-                read_only,
+                read_only: !editable,
             })
             .collect();
         MutationView {
@@ -199,6 +205,7 @@ impl From<Mutation> for MutationView {
             summary: status.summary,
             message: status.message,
             read_only,
+            variants_editable: editable,
         }
     }
 }
@@ -312,7 +319,12 @@ where
 {
     for _ in 0..MAX_ATTEMPTS {
         let current = api.get(name).await?;
-        refuse_if_gitops(&current)?;
+        if !variants_editable(&current) {
+            return Err(ApiError::Conflict(format!(
+                "mutation {name} is synced by Argo CD without {}: \"true\"; change its variants in git instead",
+                crate::crd::RUNTIME_VARIANTS_ANNOTATION
+            )));
+        }
         let mut variants = current.spec.variants.clone();
         edit(&mut variants)?;
         let patch = json!({

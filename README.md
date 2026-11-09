@@ -112,10 +112,28 @@ browser-snap   browser-snap   2/2 variants ready    browser-snap-secret   1m
 
 ### Argo CD
 
-Mutations are meant to be created at runtime, so they do not go in git.
-The operator API refuses to change or delete a Mutation that Argo CD syncs
-(one with its `argocd.argoproj.io/tracking-id` annotation or
-`app.kubernetes.io/instance` label), because the next sync would undo it.
+A Mutation made entirely at runtime does not go in git. One whose base
+should live in git, with its variants still managed at runtime, can be
+synced by Argo CD, if it opts in and leaves `variants` out of its manifest:
+
+```yaml
+apiVersion: neiam.org/v1
+kind: Mutation
+metadata:
+  name: browser-snap
+  annotations:
+    mutantops.neiam.org/runtime-variants: "true"
+spec:
+  deployment: { ... }   # no `variants`: those belong to the API
+```
+
+Argo CD only applies and diffs the fields its manifest declares, so it
+neither reverts nor reports the variants the API adds. The API recognises a
+synced Mutation by Argo CD's `argocd.argoproj.io/tracking-id` annotation or
+`app.kubernetes.io/instance` label and never deletes one. Without the
+annotation it refuses variant changes too (`readOnly: true`), because they
+would belong in git.
+
 To show Mutation health in Argo CD, add to `argocd-cm`:
 
 ```yaml
