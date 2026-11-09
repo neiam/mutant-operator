@@ -162,7 +162,7 @@ Every `/api` request needs `Authorization: Bearer <token>`, and which token
 depends on the request:
 
 - **A Mutation's own token** (`token` in its `<name>-secret`) allows getting
-  that Mutation and listing, adding and removing its variants, and nothing
+  that Mutation and listing, adding, scaling and removing its variants, and nothing
   else. An app in the Mutation's namespace reads it from that Secret, so it
   can manage its own Mutation's variants without credentials for anything
   else. The operator only accepts a Secret owned by the Mutation, so one
@@ -185,8 +185,12 @@ DELETE /api/v1/namespaces/{ns}/mutations/{name}
 GET    /api/v1/namespaces/{ns}/mutations/{name}/variants
 POST   /api/v1/namespaces/{ns}/mutations/{name}/variants   {label, env, instances}
 GET    /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}
+PATCH  /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}   {instances}
 DELETE /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}
 ```
+
+`PATCH` scales a variant in place: its Deployment's replica count changes
+and the running pods are kept.
 
 Creating answers 201, or 400 if invalid and 409 if the name or label is
 taken. Deleting answers 204, or 404 if absent. Changes to an Argo-synced
@@ -209,6 +213,8 @@ WEB=$(kubectl -n default get secret web-secret -o jsonpath='{.data.token}' | bas
 AUTH="Authorization: Bearer $WEB"
 curl -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"label":"beta","env":{"FEATURE_X":"on"},"instances":2}' $NS/mutations/web/variants
+curl -X PATCH -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"instances":4}' $NS/mutations/web/variants/beta
 curl -X DELETE -H "$AUTH" $NS/mutations/web/variants/beta
 # list
 curl -H "$AUTH" $NS/mutations

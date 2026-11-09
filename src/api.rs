@@ -10,13 +10,15 @@
 //! GET    /api/v1/namespaces/{ns}/mutations/{name}/variants
 //! POST   /api/v1/namespaces/{ns}/mutations/{name}/variants   {label, env, instances}
 //! GET    /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}
+//! PATCH  /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}   {instances}
 //! DELETE /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}
 //! ```
 //!
 //! ## Authorization
 //!
 //! Requests carry `Authorization: Bearer <token>`. A request about one
-//! Mutation -- getting it, listing, adding or removing its variants -- is
+//! Mutation -- getting it, listing, adding, scaling or removing its
+//! variants -- is
 //! allowed with that Mutation's own token: the `token` in the
 //! `<name>-secret` the operator generated for it, in its namespace. An app
 //! reads that Secret from its own namespace and can then manage that one
@@ -87,7 +89,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/namespaces/{ns}/mutations/{name}/variants/{label}",
-            get(get_variant).delete(delete_variant),
+            get(get_variant).patch(update_variant).delete(delete_variant),
         );
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -222,6 +224,14 @@ struct VariantView {
     variant: Variant,
     status: VariantStatus,
     read_only: bool,
+}
+
+/// A change to an existing variant. Only its replica count, for now: a
+/// variant's label and env are what make it that variant.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateVariant {
+    instances: i32,
 }
 
 #[derive(Deserialize)]
@@ -365,6 +375,34 @@ async fn delete_variant(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Scales a variant in place: its Deployment's replicas change, and the
+/// pods already running are kept.
+async fn update_variant(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path((ns, name, label)): Path<(String, String, String)>,
+    Json(req): Json<UpdateVariant>,
+) -> ApiResult<Json<Variant>> {
+    authorize_mutation(&st, &headers, &ns, &name).await?;
+    if req.instances < 0 {
+        return Err(ApiError::BadRequest(format!("instances must be >= 0, got {}", req.instances)));
+    }
+    let updated = std::sync::Mutex::new(None);
+    update_variants(&st.mutations(&ns), &name, |list| {
+        let v = list
+            .iter_mut()
+            .find(|v| v.label == label)
+            .ok_or_else(|| ApiError::NotFound(format!("variant {label:?} not found")))?;
+        v.instances = req.instances;
+        *updated.lock().unwrap() = Some(v.clone());
+        Ok(())
+    })
+    .await?;
+    info!(%ns, %name, %label, instances = req.instances, "variant scaled");
+    let variant = updated.into_inner().unwrap().expect("set by the successful edit");
+    Ok(Json(variant))
+}
+
 fn refuse_if_gitops(m: &Mutation) -> ApiResult<()> {
     if is_gitops_managed(m) {
         return Err(ApiError::Conflict(format!(
@@ -422,6 +460,15 @@ mod tests {
         assert!(!admin_ok(None, false, Some("anything")));
         assert!(!admin_ok(None, false, None));
         assert!(admin_ok(None, true, None));
+    }
+
+    #[test]
+    fn update_variant_body() {
+        let ok: UpdateVariant = serde_json::from_str(r#"{"instances": 3}"#).unwrap();
+        assert_eq!(ok.instances, 3);
+        // A label or env change is not a scale; refused rather than ignored.
+        assert!(serde_json::from_str::<UpdateVariant>(r#"{"instances": 3, "label": "x"}"#).is_err());
+        assert!(serde_json::from_str::<UpdateVariant>(r#"{}"#).is_err());
     }
 
     #[test]
