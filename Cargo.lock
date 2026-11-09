@@ -1894,6 +1894,7 @@ dependencies = [
  "axum",
  "derive",
  "futures",
+ "getrandom 0.3.2",
  "k8s-openapi",
  "kube",
  "schemars",

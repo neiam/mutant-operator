@@ -66,55 +66,25 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: mutantops-operator
+# Only what the operator uses: generated Deployments, MutantDeployments
+# (read), Mutations and their status, and each Mutation's generated Secret
+# (get/create only; garbage collection deletes it with the Mutation).
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  - services
-  - services/finalizers
-  - endpoints
-  - persistentvolumeclaims
-  - events
-  - configmaps
-  - secrets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - apps
-  resources:
-  - deployments
-  - daemonsets
-  - replicasets
-  - statefulsets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - neiam.org
-  resources:
-  - mutantdeployments
-  - mutations
-  - mutations/status
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
-  - watch
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["neiam.org"]
+  resources: ["mutantdeployments"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["neiam.org"]
+  resources: ["mutations"]
+  verbs: ["get", "list", "watch", "create", "patch", "delete"]
+- apiGroups: ["neiam.org"]
+  resources: ["mutations/status"]
+  verbs: ["get", "patch", "update"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

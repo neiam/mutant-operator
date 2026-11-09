@@ -44,103 +44,154 @@ spec:
       NGINX_EXPERIMENTAL: "true"
     instances: 3
 ```
+
 Removing a mutation from the list deletes its Deployment. Deleting the
 MutantDeployment deletes all of them.
 
-## Mutation resources
+## Mutations: variants configured at runtime
 
-Mutations can also be standalone `Mutation` resources, created at runtime
-without touching the MutantDeployment. Use them when the MutantDeployment is
-owned by Argo CD or another GitOps tool:
+A `Mutation` is the same thing as a MutantDeployment, a base Deployment
+plus variants of it, but it is configured at runtime through the HTTP API
+below instead of being declared in git. Use it when variants come and go
+while things run. It stays a Kubernetes object, so the operator keeps no
+state of its own.
 
 ```yaml
 apiVersion: neiam.org/v1
 kind: Mutation
 metadata:
-  name: nginx-mutant-beta
+  name: browser-snap
 spec:
-  mutantDeployment: nginx-mutant   # same namespace
-  label: beta
-  env:
-    FEATURE_X: "on"
-  instances: 2
+  deployment:            # the base, as in a MutantDeployment
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: browser-snap
+    spec: { ... }
+  variants:
+  - label: radxa-8-hd
+    env:
+      SNAP_RES: "1280x800"
+    instances: 3
+  - label: lilygo47
+    env:
+      SNAP_RES: "960x540"
+    instances: 1
 ```
 
 ```console
 $ kubectl get mutations
-NAME                TARGET         LABEL   INSTANCES   READY   STATE   AGE
-nginx-mutant-beta   nginx-mutant   beta    2           2       Ready   1m
+NAME           BASE           READY                 SECRET                AGE
+browser-snap   browser-snap   2/2 variants ready    browser-snap-secret   1m
 ```
 
-- A MutantDeployment runs its inline `spec.mutations` plus every Mutation
-  that targets it. Labels are unique per MutantDeployment. An inline
-  mutation wins a clash, then the oldest Mutation. A Mutation that loses is
-  not run and shows `State: Conflict`.
-- `status` reports the generated Deployment, its ready replicas, and
-  `Progressing`, `Ready`, `Invalid` or `Conflict`.
-- The operator makes each Mutation a dependent (`ownerReferences`) of its
-  MutantDeployment. Argo CD shows it under the MutantDeployment in the
-  resource tree, and deleting the MutantDeployment deletes its Mutations.
+- Each variant becomes Deployment `<base name>-<label>`. Adding a variant
+  starts one, removing it deletes it, and deleting the Mutation deletes
+  them all.
+- Each Mutation gets a Secret, `<mutation-name>-secret`, holding a random
+  64-hex-character `token`. The operator creates it once and never rewrites
+  it, and it is deleted with the Mutation. It is not injected into the
+  variants' pods. Anything in the namespace can read it as an env var:
+
+  ```yaml
+  - name: BROWSER_SNAP_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: browser-snap-secret
+        key: token
+        optional: true   # exists once the operator has seen the Mutation
+  ```
+
+- `status` reports the Secret, a summary, and each variant's Deployment,
+  ready replicas and state: `Progressing`, `Ready`, `Invalid`, or
+  `Conflict`. `Conflict` means the label repeats, or the Deployment name is
+  already owned by another Mutation or MutantDeployment. The operator never
+  takes over another owner's Deployment.
+- If the base is invalid, nothing is applied or pruned: what is running
+  keeps running until the base is fixed.
 
 ### Argo CD
 
-Mutations created through the API are not in git and carry no Argo CD
-tracking label, so Argo CD neither prunes nor reverts them. Inline
-mutations remain in git and are read-only through the API. For Argo CD to
-show Mutation health, add to `argocd-cm`:
+Mutations are meant to be created at runtime, so they do not go in git.
+The operator API refuses to change or delete a Mutation that Argo CD syncs
+(one with its `argocd.argoproj.io/tracking-id` annotation or
+`app.kubernetes.io/instance` label), because the next sync would undo it.
+To show Mutation health in Argo CD, add to `argocd-cm`:
 
 ```yaml
 resource.customizations.health.neiam.org_Mutation: |
   hs = { status = "Progressing", message = "Waiting for the operator" }
-  if obj.status ~= nil and obj.status.state ~= nil then
-    hs.message = obj.status.message or obj.status.state
-    if obj.status.state == "Ready" then hs.status = "Healthy"
-    elseif obj.status.state == "Progressing" then hs.status = "Progressing"
-    else hs.status = "Degraded" end
+  if obj.status ~= nil and obj.status.variants ~= nil then
+    hs.status = "Healthy"
+    hs.message = obj.status.summary
+    for _, v in ipairs(obj.status.variants) do
+      if v.state == "Invalid" or v.state == "Conflict" then
+        hs.status = "Degraded"; hs.message = v.label .. ": " .. (v.message or v.state); break
+      elseif v.state == "Progressing" then
+        hs.status = "Progressing"
+      end
+    end
   end
   return hs
 ```
 
 ## HTTP API
 
-The operator serves an HTTP API to list, create and destroy mutations.
-Creating one makes a Mutation resource named `<mutantdeployment>-<label>`.
-Destroying one deletes it.
+The operator serves an HTTP API to create, list and delete Mutations and
+their variants.
 
 The API is off until `MUTANT_API_TOKEN` is set (`operator.yml` reads it from
 the `mutantops-api` secret). Every `/api` request then needs
 `Authorization: Bearer <token>`. `MUTANT_API_INSECURE=true` serves it without
 auth. `MUTANT_API_ADDR` sets the listen address (default `0.0.0.0:8080`).
 
+```text
+GET    /api/v1/namespaces/{ns}/mutations
+POST   /api/v1/namespaces/{ns}/mutations                   {name, deployment, variants}
+GET    /api/v1/namespaces/{ns}/mutations/{name}
+DELETE /api/v1/namespaces/{ns}/mutations/{name}
+GET    /api/v1/namespaces/{ns}/mutations/{name}/variants
+POST   /api/v1/namespaces/{ns}/mutations/{name}/variants   {label, env, instances}
+GET    /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}
+DELETE /api/v1/namespaces/{ns}/mutations/{name}/variants/{label}
+```
+
+Creating answers 201, or 400 if invalid and 409 if the name or label is
+taken. Deleting answers 204, or 404 if absent. Changes to an Argo-synced
+Mutation answer 409. Concurrent variant edits are serialised on the
+Mutation's `resourceVersion`, so none is lost.
+
 ```sh
 kubectl -n mutants create secret generic mutantops-api --from-literal=token="$(openssl rand -hex 32)"
 kubectl -n mutants rollout restart deploy/mutantops-operator
 TOKEN=$(kubectl -n mutants get secret mutantops-api -o jsonpath='{.data.token}' | base64 -d)
 API=http://mutantops-api.mutants.svc   # or: kubectl -n mutants port-forward svc/mutantops-api 8080:80
-MD=$API/api/v1/namespaces/default/mutantdeployments/nginx-mutant
+NS=$API/api/v1/namespaces/default
+AUTH="Authorization: Bearer $TOKEN"
 
-# MutantDeployments in a namespace, with their running mutation labels
-curl -H "Authorization: Bearer $TOKEN" $API/api/v1/namespaces/default/mutantdeployments
-# list / get mutations: inline and resource, with live status
-curl -H "Authorization: Bearer $TOKEN" $MD/mutations
-curl -H "Authorization: Bearer $TOKEN" $MD/mutations/canary
-# create (201; 409 if the label is taken, 400 if invalid, 404 if no such MutantDeployment)
-curl -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"label":"beta","env":{"FEATURE_X":"on"},"instances":2}' $MD/mutations
-# destroy (204; 404 if absent; 409 if inline, which is changed in git instead)
-curl -X DELETE -H "Authorization: Bearer $TOKEN" $MD/mutations/beta
+# create a Mutation from a base Deployment (deployment.json)
+jq -n --slurpfile d deployment.json '{name: "web", deployment: $d[0], variants: []}' |
+  curl -H "$AUTH" -H 'Content-Type: application/json' -d @- $NS/mutations
+# add and remove variants
+curl -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"label":"beta","env":{"FEATURE_X":"on"},"instances":2}' $NS/mutations/web/variants
+curl -X DELETE -H "$AUTH" $NS/mutations/web/variants/beta
+# list
+curl -H "$AUTH" $NS/mutations
+curl -H "$AUTH" $NS/mutations/web/variants
 ```
 
-A listed mutation looks like:
+A listed variant looks like:
 
 ```json
 {
   "label": "beta",
   "env": { "FEATURE_X": "on" },
   "instances": 2,
-  "source": { "kind": "resource", "name": "nginx-mutant-beta" },
-  "status": { "state": "Ready", "message": null, "deployment": "nginx-beta", "replicas": 2, "readyReplicas": 2 }
+  "readOnly": false,
+  "status": { "label": "beta", "state": "Ready", "message": null, "deployment": "web-beta", "replicas": 2, "readyReplicas": 2 }
 }
 ```
 
-`source.kind` is `inline` for mutations declared in the MutantDeployment.
+A Mutation adds its `name`, `namespace`, base `deployment`, `variants`,
+`secret`, `summary`, `message` and `readOnly`.

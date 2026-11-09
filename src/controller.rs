@@ -1,18 +1,21 @@
-//! Reconciles each MutantDeployment, together with the Mutation resources
-//! that target it, into one Deployment per mutation; prunes Deployments
-//! whose mutation is gone; and reports each Mutation's state in its status.
+//! Reconciles MutantDeployments and Mutations alike: a base Deployment plus
+//! variants becomes one Deployment per variant, and Deployments whose
+//! variant is gone are pruned. A Mutation also gets a generated Secret and a
+//! status reporting each variant.
 
 use crate::crd::{
-    applied_status, build_deployment, resolve, MutantDeployment, Mutation, MutationStatus, Source,
+    applied_status, build_deployment, build_secret, deployment_name, generate_token, secret_name, summarize,
+    validate_base, MutantDeployment, Mutation, MutationStatus, Variant, VariantState, VariantStatus,
     MUTATION_LABEL, OWNER_LABEL,
 };
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{
-    api::{Api, DeleteParams, ListParams, Patch, PatchParams},
+    api::{Api, DeleteParams, ListParams, Patch, PatchParams, PostParams},
     runtime::{
         controller::{Action, Controller},
-        reflector::ObjectRef,
         watcher,
     },
     Client, Resource, ResourceExt,
@@ -22,9 +25,7 @@ use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 use tracing::{info, warn};
 
 const FIELD_MANAGER: &str = "mutantops-operator";
-/// Periodic resync. Events drive reconciliation; this only catches what no
-/// event points at, such as a Mutation retargeted away from a
-/// MutantDeployment, whose old Deployment is then pruned.
+/// Periodic resync. Events drive reconciliation; this is a backstop.
 const RESYNC: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
@@ -54,113 +55,200 @@ struct Ctx {
     client: Client,
 }
 
-async fn reconcile(mutant: Arc<MutantDeployment>, ctx: Arc<Ctx>) -> Result<Action, MutantopsError> {
-    let ns = mutant
-        .namespace()
-        .ok_or_else(|| MutantopsError::Invalid("MutantDeployment has no namespace".into()))?;
-    let controller_ref = mutant
-        .controller_owner_ref(&())
-        .ok_or_else(|| MutantopsError::Invalid("MutantDeployment has no uid".into()))?;
-    let deployments: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns);
-    let mutations: Api<Mutation> = Api::namespaced(ctx.client.clone(), &ns);
+/// Who the generated Deployments belong to.
+struct Owner {
+    name: String,
+    ns: String,
+    controller_ref: OwnerReference,
+}
+
+impl Owner {
+    fn of<K: Resource<DynamicType = ()>>(obj: &K) -> Result<Self, MutantopsError> {
+        Ok(Self {
+            name: obj.name_any(),
+            ns: obj
+                .namespace()
+                .ok_or_else(|| MutantopsError::Invalid(format!("{} has no namespace", obj.name_any())))?,
+            controller_ref: obj
+                .controller_owner_ref(&())
+                .ok_or_else(|| MutantopsError::Invalid(format!("{} has no uid", obj.name_any())))?,
+        })
+    }
+}
+
+/// Applies one Deployment per variant of `base` and prunes the owner's
+/// Deployments whose variant is gone. Returns each variant's status.
+///
+/// A variant is skipped, and reported, when it is invalid, repeats an
+/// earlier label, or its Deployment name is already controlled by a
+/// different owner: two owners would otherwise take turns overwriting it.
+async fn apply_variants(
+    client: &Client,
+    owner: &Owner,
+    base: &Deployment,
+    variants: &[Variant],
+) -> Result<Vec<VariantStatus>, kube::Error> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), &owner.ns);
     let apply = PatchParams::apply(FIELD_MANAGER).force();
+    let uid = &owner.controller_ref.uid;
 
-    // Inline entries can only be edited in the MutantDeployment itself, and
-    // have no status to report into, so a bad one is just logged.
-    for def in &mutant.spec.mutations {
-        if let Err(msg) = def.validate() {
-            warn!(mutant = %mutant.name_any(), %ns, "skipping inline mutation: {msg}");
-        }
-    }
-
-    let resources = mutations.list(&ListParams::default()).await?.items;
-    // Each Mutation becomes a dependent of its MutantDeployment: Argo CD then
-    // shows it in the MutantDeployment's resource tree, and deleting the
-    // MutantDeployment garbage-collects it. Done before the status writes
-    // below, which would invalidate the resourceVersion this is guarded by.
-    let owner = mutant.owner_ref(&()).expect("uid checked above");
-    for m in resources.iter().filter(|m| m.spec.mutant_deployment == mutant.name_any()) {
-        if !m.owner_references().iter().any(|o| o.uid == owner.uid) {
-            let mut refs = m.owner_references().to_vec();
-            refs.push(owner.clone());
-            let patch = json!({ "metadata": { "ownerReferences": refs, "resourceVersion": m.resource_version() } });
-            mutations.patch(&m.name_any(), &PatchParams::default(), &Patch::Merge(&patch)).await?;
-        }
-    }
-
-    let resolved = resolve(&mutant, &resources);
-    let find = |name: &str| resources.iter().find(|m| m.name_any() == name);
-
+    let mut statuses = Vec::with_capacity(variants.len());
     let mut wanted = HashSet::new();
-    for (def, source) in &resolved.active {
-        let name = mutant.deployment_name(&def.label);
-        let deploy = build_deployment(&mutant, def, controller_ref.clone());
-        let applied = deployments.patch(&name, &apply, &Patch::Apply(&deploy)).await?;
-        if let Source::Resource { name: mname } = source {
-            if let Some(m) = find(mname) {
-                set_status(&mutations, m, applied_status(name.clone(), def.instances, Some(&applied))).await?;
+    let mut labels = HashSet::new();
+    for v in variants {
+        if let Err(msg) = v.validate() {
+            statuses.push(VariantStatus::rejected(&v.label, VariantState::Invalid, msg));
+            continue;
+        }
+        if !labels.insert(v.label.as_str()) {
+            let msg = "label repeats an earlier variant".to_string();
+            statuses.push(VariantStatus::rejected(&v.label, VariantState::Conflict, msg));
+            continue;
+        }
+        let name = deployment_name(base, &v.label);
+        if let Some(existing) = api.get_opt(&name).await? {
+            let other = existing.owner_references().iter().find(|o| o.controller == Some(true) && &o.uid != uid);
+            if let Some(other) = other {
+                let msg = format!("deployment {name} is already managed by {} {}", other.kind, other.name);
+                statuses.push(VariantStatus::rejected(&v.label, VariantState::Conflict, msg));
+                continue;
             }
         }
+        let deploy = build_deployment(base, Some(owner.ns.clone()), &owner.name, v, owner.controller_ref.clone());
+        let applied = api.patch(&name, &apply, &Patch::Apply(&deploy)).await?;
+        statuses.push(applied_status(&v.label, name.clone(), v.instances, Some(&applied)));
         wanted.insert(name);
     }
-    for (mname, state, message) in &resolved.rejected {
-        if let Some(m) = find(mname) {
-            let status = MutationStatus { state: *state, message: Some(message.clone()), ..Default::default() };
-            set_status(&mutations, m, status).await?;
-        }
-    }
 
-    // Prune: Deployments this MutantDeployment owns whose mutation is gone.
-    // Checking the owner uid as well as the label means a Deployment that
-    // merely carries the label is never deleted.
-    let selector = format!("{OWNER_LABEL}={}", mutant.name_any());
-    for existing in deployments.list(&ListParams::default().labels(&selector)).await? {
+    // Prune. Checking the owner uid as well as the label means a Deployment
+    // that merely carries the label, or belongs to a same-named owner of
+    // the other kind, is never deleted.
+    let selector = format!("{OWNER_LABEL}={}", owner.name);
+    for existing in api.list(&ListParams::default().labels(&selector)).await? {
         let name = existing.name_any();
-        let owned = existing.owner_references().iter().any(|o| o.uid == controller_ref.uid);
+        let owned = existing.owner_references().iter().any(|o| &o.uid == uid);
         if owned && !wanted.contains(&name) {
-            info!(%name, %ns, mutation = ?existing.labels().get(MUTATION_LABEL), "pruning removed mutation");
-            deployments.delete(&name, &DeleteParams::background()).await?;
+            info!(%name, ns = %owner.ns, variant = ?existing.labels().get(MUTATION_LABEL), "pruning removed variant");
+            api.delete(&name, &DeleteParams::background()).await?;
         }
     }
+    Ok(statuses)
+}
 
+async fn reconcile_mutant(md: Arc<MutantDeployment>, ctx: Arc<Ctx>) -> Result<Action, MutantopsError> {
+    let owner = Owner::of(md.as_ref())?;
+    // A MutantDeployment has no status to report into, so problems are logged.
+    for s in apply_variants(&ctx.client, &owner, &md.spec.deployment, &md.spec.mutations).await? {
+        if let Some(msg) = s.message {
+            warn!(mutant = %owner.name, ns = %owner.ns, variant = %s.label, state = ?s.state, "{msg}");
+        }
+    }
     Ok(Action::requeue(RESYNC))
 }
 
-/// Writes `status` unless it is already current. Skipping no-op writes
-/// matters: every write is a watch event that reconciles again.
-async fn set_status(api: &Api<Mutation>, m: &Mutation, status: MutationStatus) -> Result<(), kube::Error> {
-    if m.status.as_ref() == Some(&status) {
-        return Ok(());
+async fn reconcile_mutation(m: Arc<Mutation>, ctx: Arc<Ctx>) -> Result<Action, MutantopsError> {
+    if m.metadata.deletion_timestamp.is_some() {
+        // Garbage collection removes its Deployments and Secret.
+        return Ok(Action::await_change());
     }
-    let patch = json!({ "status": status });
-    api.patch_status(&m.name_any(), &PatchParams::default(), &Patch::Merge(&patch)).await?;
-    Ok(())
+    let owner = Owner::of(m.as_ref())?;
+    let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &owner.ns);
+
+    let mut status = MutationStatus::default();
+    match ensure_secret(&secrets, &m).await? {
+        Ok(name) => status.secret = Some(name),
+        Err(msg) => status.message = Some(msg),
+    }
+    match validate_base(&m.spec.deployment) {
+        // Nothing is applied or pruned from a broken base: what is running
+        // keeps running until the base is fixed.
+        Err(msg) => status.message = Some(msg),
+        Ok(()) => status.variants = apply_variants(&ctx.client, &owner, &m.spec.deployment, &m.spec.variants).await?,
+    }
+    status.summary = Some(summarize(&status.variants));
+
+    if m.status.as_ref() != Some(&status) {
+        // Skipped when unchanged: every write is a watch event, which would
+        // reconcile again.
+        let api: Api<Mutation> = Api::namespaced(ctx.client.clone(), &owner.ns);
+        let patch = json!({ "status": status });
+        api.patch_status(&owner.name, &PatchParams::default(), &Patch::Merge(&patch)).await?;
+    }
+    Ok(Action::requeue(RESYNC))
 }
 
-fn error_policy(mutant: Arc<MutantDeployment>, error: &MutantopsError, _ctx: Arc<Ctx>) -> Action {
-    warn!(mutant = %mutant.name_any(), "reconcile failed: {error}");
+/// Creates the Mutation's Secret unless it exists, returning its name, or
+/// why there is none as a message for the Mutation's status.
+///
+/// An existing Secret is never rewritten, so the token stays stable. One
+/// that this Mutation does not own is left alone and reported: it was made
+/// by someone else, and its contents are not ours to vouch for.
+async fn ensure_secret(api: &Api<Secret>, m: &Mutation) -> Result<Result<String, String>, MutantopsError> {
+    let name = secret_name(&m.name_any());
+    let uid = m.uid();
+    let owned = |s: &Secret| s.owner_references().iter().any(|o| Some(&o.uid) == uid.as_ref());
+
+    if let Some(existing) = api.get_opt(&name).await? {
+        return Ok(if owned(&existing) {
+            Ok(name)
+        } else {
+            Err(format!("secret {name} exists but is not owned by this Mutation; not using it"))
+        });
+    }
+
+    let owner = m
+        .controller_owner_ref(&())
+        .ok_or_else(|| MutantopsError::Invalid("Mutation has no uid".into()))?;
+    let token = generate_token().map_err(|e| MutantopsError::Invalid(format!("no randomness for token: {e}")))?;
+    match api.create(&PostParams::default(), &build_secret(m, owner, token)).await {
+        Ok(_) => {
+            info!(secret = %name, mutation = %m.name_any(), "created mutation secret");
+            Ok(Ok(name))
+        }
+        // Lost a race with another reconcile; the next pass checks ownership.
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(Ok(name)),
+        // Invalid for this Mutation alone: report it there.
+        Err(kube::Error::Api(e)) if e.code == 422 => {
+            warn!(secret = %name, "cannot create mutation secret: {}", e.message);
+            Ok(Err(format!("cannot create secret {name}: {}", e.message)))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn error_policy<K: ResourceExt>(obj: Arc<K>, error: &MutantopsError, _ctx: Arc<Ctx>) -> Action {
+    warn!(name = %obj.name_any(), ns = ?obj.namespace(), "reconcile failed: {error}");
     Action::requeue(Duration::from_secs(10))
 }
 
-/// Runs the controller until a shutdown signal.
+/// Runs both controllers until a shutdown signal.
 pub async fn run(client: Client) {
-    let mutants = Api::<MutantDeployment>::all(client.clone());
-    Controller::new(mutants, watcher::Config::default())
-        // Watch only the Deployments we generate: a hand edit or delete is
-        // put back, and replica readiness flows into Mutation status.
-        .owns(Api::<Deployment>::all(client.clone()), watcher::Config::default().labels(OWNER_LABEL))
-        // A Mutation created, changed or deleted reconciles its target.
-        .watches(Api::<Mutation>::all(client.clone()), watcher::Config::default(), |m| {
-            let ns = m.namespace()?;
-            Some(ObjectRef::new(&m.spec.mutant_deployment).within(&ns))
-        })
+    let ctx = Arc::new(Ctx { client: client.clone() });
+    // Each watches only the Deployments it generates: a hand edit or delete
+    // is put back, and replica readiness flows into status.
+    let owned = || watcher::Config::default().labels(OWNER_LABEL);
+
+    let mutants = Controller::new(Api::<MutantDeployment>::all(client.clone()), watcher::Config::default())
+        .owns(Api::<Deployment>::all(client.clone()), owned())
         .shutdown_on_signal()
-        .run(reconcile, error_policy, Arc::new(Ctx { client }))
+        .run(reconcile_mutant, error_policy, ctx.clone())
         .for_each(|res| async move {
             match res {
-                Ok((obj, _)) => info!(name = %obj.name, ns = ?obj.namespace, "reconciled"),
-                Err(err) => warn!("reconcile failed: {err}"),
+                Ok((obj, _)) => info!(kind = "MutantDeployment", name = %obj.name, ns = ?obj.namespace, "reconciled"),
+                Err(err) => warn!(kind = "MutantDeployment", "reconcile failed: {err}"),
             }
-        })
-        .await;
+        });
+
+    let mutations = Controller::new(Api::<Mutation>::all(client.clone()), watcher::Config::default())
+        .owns(Api::<Deployment>::all(client.clone()), owned())
+        .shutdown_on_signal()
+        .run(reconcile_mutation, error_policy, ctx)
+        .for_each(|res| async move {
+            match res {
+                Ok((obj, _)) => info!(kind = "Mutation", name = %obj.name, ns = ?obj.namespace, "reconciled"),
+                Err(err) => warn!(kind = "Mutation", "reconcile failed: {err}"),
+            }
+        });
+
+    futures::join!(mutants, mutations);
 }
