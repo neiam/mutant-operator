@@ -1,5 +1,9 @@
 # Mutant Operations
 
+<!-- gg:badges ci workflow:audit workflow:clippy release license package:oci:mutant-operator -->
+[![CI status](https://gg.neiam.co/r/neiam/mutant-operator/badge/ci.svg)](https://gg.neiam.co/r/neiam/mutant-operator/actions) [![audit status](https://gg.neiam.co/r/neiam/mutant-operator/badge/workflow/audit.svg)](https://gg.neiam.co/r/neiam/mutant-operator/actions) [![clippy status](https://gg.neiam.co/r/neiam/mutant-operator/badge/workflow/clippy.svg)](https://gg.neiam.co/r/neiam/mutant-operator/actions) [![latest release](https://gg.neiam.co/r/neiam/mutant-operator/badge/release.svg)](https://gg.neiam.co/r/neiam/mutant-operator) [![license](https://gg.neiam.co/r/neiam/mutant-operator/badge/license.svg)](https://gg.neiam.co/r/neiam/mutant-operator/blob/master/LICENSE.md) [![install mutant-operator](https://gg.neiam.co/r/neiam/mutant-operator/badge/package/oci/mutant-operator.svg)](https://gg.neiam.co/r/neiam/mutant-operator/packages)
+<!-- /gg:badges -->
+
 A Kubernetes Operator
 
 # Motivation
